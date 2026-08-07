@@ -1,0 +1,1165 @@
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import xgboost as xgb
+
+from matplotlib.patches import Patch
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import KFold, cross_validate, train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+RANDOM_STATE = 42
+
+DATA_PATH = Path("data/data.csv")
+RESULTS_DIR = Path("results")
+RESULTS_DIR.mkdir(exist_ok=True)
+
+TARGET_COL = "land_surface_temperature"
+BLOCK_COL = "climatic_block_no"
+BLOCKS = [f"block_{i}" for i in range(1, 6)]
+
+FIXED_FEATURES = [
+    "building_height",
+    "building_density",
+    "distance_from_road",
+    "non_vegetated",
+]
+
+CHANGEABLE_FEATURES = [
+    "tree_vegetation",
+    "non_tree_vegetation",
+    "water_body",
+    "bare_land",
+]
+
+ALL_FEATURES = CHANGEABLE_FEATURES + FIXED_FEATURES
+
+sns.set_theme(style="whitegrid", palette="muted")
+plt.rcParams["figure.dpi"] = 120
+
+
+df = pd.read_csv(DATA_PATH)
+
+print(f"Rows: {len(df):,}")
+print(f"Columns: {df.shape[1]}")
+df.head()
+
+
+df.info()
+
+
+missing = df.isnull().sum()
+missing_pct = (missing / len(df) * 100).round(2)
+
+missing_df = pd.DataFrame({
+    "missing_count": missing,
+    "missing_%": missing_pct
+})
+
+missing_df[missing_df["missing_count"] > 0]
+
+
+fig, ax = plt.subplots(figsize=(8, 4))
+
+missing_pct[missing_pct > 0].sort_values().plot(
+    kind="barh",
+    ax=ax,
+    color="steelblue"
+)
+
+ax.set_xlabel("Missing (%)")
+ax.set_title("Columns with Missing Values")
+
+plt.tight_layout()
+plt.show()
+
+
+numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
+
+df[numeric_cols].describe().T.round(4)
+
+
+n_cols = 3
+n_rows = int(np.ceil(len(numeric_cols) / n_cols))
+
+fig, axes = plt.subplots(
+    n_rows,
+    n_cols,
+    figsize=(15, n_rows * 3.5)
+)
+
+axes = axes.flatten()
+
+for i, col in enumerate(numeric_cols):
+    axes[i].hist(
+        df[col].dropna(),
+        bins=50,
+        color="steelblue",
+        edgecolor="white",
+        linewidth=0.3
+    )
+    axes[i].set_title(col)
+
+for j in range(i + 1, len(axes)):
+    axes[j].set_visible(False)
+
+plt.suptitle("Feature Distributions", y=1.01, fontsize=14)
+plt.tight_layout()
+plt.show()
+
+
+block_counts = df[BLOCK_COL].value_counts().sort_index()
+
+print("Pixel counts per block:")
+print(block_counts)
+
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+blocks = sorted(df[BLOCK_COL].unique())
+
+data_per_block = [
+    df.loc[df[BLOCK_COL] == block, TARGET_COL].dropna().values
+    for block in blocks
+]
+
+axes[0].boxplot(
+    data_per_block,
+    labels=blocks,
+    patch_artist=True,
+    boxprops=dict(facecolor="steelblue", alpha=0.6)
+)
+
+axes[0].set_title("LST Distribution per Block")
+axes[0].set_ylabel("LST (°C)")
+axes[0].tick_params(axis="x", rotation=30)
+
+mean_lst = (
+    df.groupby(BLOCK_COL)[TARGET_COL]
+    .mean()
+    .sort_index()
+)
+
+mean_lst.plot(
+    kind="bar",
+    ax=axes[1],
+    color="tomato",
+    edgecolor="white"
+)
+
+axes[1].set_title("Mean LST per Block")
+axes[1].set_ylabel("Mean LST (°C)")
+axes[1].set_xlabel("")
+axes[1].tick_params(axis="x", rotation=30)
+
+plt.tight_layout()
+plt.show()
+
+
+df.groupby(BLOCK_COL)[numeric_cols].mean().round(4)
+
+
+corr_with_lst = (
+    df[numeric_cols]
+    .corr()[TARGET_COL]
+    .drop(TARGET_COL)
+    .sort_values()
+)
+
+fig, ax = plt.subplots(figsize=(8, 5))
+
+colors = [
+    "tomato" if value > 0 else "steelblue"
+    for value in corr_with_lst
+]
+
+corr_with_lst.plot(
+    kind="barh",
+    ax=ax,
+    color=colors
+)
+
+ax.axvline(0, color="black", linewidth=0.8)
+ax.set_title("Pearson Correlation of Features with LST")
+ax.set_xlabel("Correlation")
+
+plt.tight_layout()
+plt.show()
+
+
+fig, ax = plt.subplots(figsize=(10, 8))
+
+corr_matrix = df[numeric_cols].corr()
+mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
+
+sns.heatmap(
+    corr_matrix,
+    mask=mask,
+    annot=True,
+    fmt=".2f",
+    cmap="coolwarm",
+    center=0,
+    linewidths=0.5,
+    ax=ax
+)
+
+ax.set_title("Feature Correlation Heatmap")
+
+plt.tight_layout()
+plt.show()
+
+
+changeable = [
+    "bare_land",
+    "water_body",
+    "non_tree_vegetation",
+    "tree_vegetation"
+]
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+axes = axes.ravel()
+
+for ax, col in zip(axes, changeable):
+    plot_df = df[[col, TARGET_COL, BLOCK_COL]].dropna()
+
+    sample_n = min(3000, len(plot_df))
+    sample = plot_df.sample(
+        sample_n,
+        random_state=RANDOM_STATE
+    )
+
+    for block in sorted(sample[BLOCK_COL].unique()):
+        block_df = sample[sample[BLOCK_COL] == block]
+
+        ax.scatter(
+            block_df[col],
+            block_df[TARGET_COL],
+            s=5,
+            alpha=0.4,
+            label=block
+        )
+
+    ax.set_xlabel(col)
+    ax.set_ylabel("LST (°C)")
+    ax.set_title(f"{col} vs LST")
+    ax.legend(fontsize=7, markerscale=2)
+
+plt.suptitle(
+    "Changeable land-cover features and LST",
+    y=1.01
+)
+
+plt.tight_layout()
+plt.show()
+
+
+veg_cols = [
+    "non_tree_vegetation",
+    "tree_vegetation",
+    "non_vegetated"
+]
+
+veg_sum = df[veg_cols].sum(axis=1)
+
+print(veg_sum.describe().round(4))
+
+outside_range = (
+    (veg_sum < 0.95) |
+    (veg_sum > 1.05)
+).sum()
+
+print(f"Rows outside 0.95–1.05: {outside_range:,}")
+
+
+outlier_summary = []
+
+for col in numeric_cols:
+    q1 = df[col].quantile(0.25)
+    q3 = df[col].quantile(0.75)
+    iqr = q3 - q1
+
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+
+    n_out = (
+        (df[col] < lower) |
+        (df[col] > upper)
+    ).sum()
+
+    outlier_summary.append({
+        "column": col,
+        "outliers": n_out,
+        "outlier_%": round(n_out / len(df) * 100, 2)
+    })
+
+pd.DataFrame(outlier_summary).set_index("column")
+
+
+df_clean = df.copy()
+
+for col in ALL_FEATURES:
+    block_median = (
+        df_clean.groupby(BLOCK_COL)[col]
+        .transform("median")
+    )
+
+    df_clean[col] = (
+        df_clean[col]
+        .fillna(block_median)
+        .fillna(df_clean[col].median())
+    )
+
+if df_clean[ALL_FEATURES].isna().any().any():
+    raise ValueError(
+        "Missing predictor values remain after imputation."
+    )
+
+
+df_encoded = pd.get_dummies(
+    df_clean,
+    columns=[BLOCK_COL],
+    dtype=float
+)
+
+block_dummies = [
+    col
+    for col in df_encoded.columns
+    if col.startswith(f"{BLOCK_COL}_")
+]
+
+feature_cols = ALL_FEATURES + block_dummies
+
+X = df_encoded[feature_cols].to_numpy()
+y = df_encoded[TARGET_COL].to_numpy()
+
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X,
+    y,
+    test_size=0.20,
+    random_state=RANDOM_STATE,
+    stratify=df_clean[BLOCK_COL]
+)
+
+print(f"Training rows: {len(X_train):,}")
+print(f"Test rows: {len(X_test):,}")
+
+
+models = {
+    "Linear Regression": Pipeline([
+        ("scale", StandardScaler()),
+        ("model", LinearRegression())
+    ]),
+
+    "Ridge": Pipeline([
+        ("scale", StandardScaler()),
+        ("model", Ridge(alpha=10))
+    ]),
+
+    "Gradient Boosting": GradientBoostingRegressor(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=5,
+        subsample=0.8,
+        random_state=RANDOM_STATE
+    ),
+
+    "Random Forest": RandomForestRegressor(
+        n_estimators=200,
+        max_features="sqrt",
+        random_state=RANDOM_STATE,
+        n_jobs=-1
+    ),
+
+    "XGBoost": xgb.XGBRegressor(
+        n_estimators=300,
+        learning_rate=0.05,
+        max_depth=6,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+        verbosity=0
+    )
+}
+
+
+cv = KFold(
+    n_splits=5,
+    shuffle=True,
+    random_state=RANDOM_STATE
+)
+
+scoring = {
+    "r2": "r2",
+    "rmse": "neg_root_mean_squared_error",
+    "mae": "neg_mean_absolute_error"
+}
+
+cv_results = {}
+
+for name, model in models.items():
+    scores = cross_validate(
+        model,
+        X_train,
+        y_train,
+        cv=cv,
+        scoring=scoring,
+        n_jobs=-1
+    )
+
+    cv_results[name] = {
+        "R2": scores["test_r2"].mean(),
+        "RMSE": -scores["test_rmse"].mean(),
+        "MAE": -scores["test_mae"].mean()
+    }
+
+
+cv_df = (
+    pd.DataFrame(cv_results)
+    .T
+    .sort_values("R2", ascending=False)
+)
+
+cv_df.round(4)
+
+
+fig, axes = plt.subplots(
+    1,
+    3,
+    figsize=(15, 4)
+)
+
+for ax, metric in zip(
+    axes,
+    ["R2", "RMSE", "MAE"]
+):
+    cv_df[metric].sort_values().plot(
+        kind="barh",
+        ax=ax,
+        color="steelblue",
+        edgecolor="white"
+    )
+
+    ax.set_title(metric)
+
+plt.suptitle(
+    "Five-fold cross-validation",
+    y=1.02
+)
+
+plt.tight_layout()
+plt.show()
+
+
+best_name = cv_df.index[0]
+best_model = models[best_name]
+
+best_model.fit(
+    X_train,
+    y_train
+)
+
+y_pred = best_model.predict(X_test)
+
+test_r2 = r2_score(
+    y_test,
+    y_pred
+)
+
+test_rmse = np.sqrt(
+    mean_squared_error(
+        y_test,
+        y_pred
+    )
+)
+
+test_mae = mean_absolute_error(
+    y_test,
+    y_pred
+)
+
+print(f"Best model: {best_name}")
+print(f"Test R²: {test_r2:.4f}")
+print(f"Test RMSE: {test_rmse:.4f} °C")
+print(f"Test MAE: {test_mae:.4f} °C")
+
+
+fig, axes = plt.subplots(
+    1,
+    2,
+    figsize=(12, 5)
+)
+
+axes[0].scatter(
+    y_test,
+    y_pred,
+    s=2,
+    alpha=0.25,
+    color="steelblue"
+)
+
+lims = [
+    min(y_test.min(), y_pred.min()),
+    max(y_test.max(), y_pred.max())
+]
+
+axes[0].plot(
+    lims,
+    lims,
+    "r--",
+    lw=1.5
+)
+
+axes[0].set_xlabel("Observed LST (°C)")
+axes[0].set_ylabel("Predicted LST (°C)")
+axes[0].set_title(
+    f"{best_name}: R² = {test_r2:.4f}"
+)
+
+
+residuals = y_test - y_pred
+
+axes[1].scatter(
+    y_pred,
+    residuals,
+    s=2,
+    alpha=0.25,
+    color="tomato"
+)
+
+axes[1].axhline(
+    0,
+    color="black",
+    lw=1
+)
+
+axes[1].set_xlabel("Predicted LST (°C)")
+axes[1].set_ylabel("Residual (°C)")
+axes[1].set_title("Residuals")
+
+plt.tight_layout()
+plt.show()
+
+
+if hasattr(best_model, "feature_importances_"):
+    importance = best_model.feature_importances_
+else:
+    importance = np.abs(
+        best_model
+        .named_steps["model"]
+        .coef_
+    )
+
+
+importance_df = (
+    pd.DataFrame({
+        "feature": feature_cols,
+        "importance": importance
+    })
+    .sort_values("importance")
+)
+
+
+bar_colors = [
+    "tomato"
+    if feature in CHANGEABLE_FEATURES
+    else "steelblue"
+    if feature in FIXED_FEATURES
+    else "silver"
+    for feature in importance_df["feature"]
+]
+
+
+fig, ax = plt.subplots(figsize=(8, 6))
+
+importance_df.set_index(
+    "feature"
+)["importance"].plot(
+    kind="barh",
+    ax=ax,
+    color=bar_colors
+)
+
+ax.set_xlabel("Importance")
+ax.set_title(
+    f"Feature importance: {best_name}"
+)
+
+ax.legend(
+    handles=[
+        Patch(
+            color="tomato",
+            label="Changeable"
+        ),
+        Patch(
+            color="steelblue",
+            label="Fixed"
+        ),
+        Patch(
+            color="silver",
+            label="Block indicator"
+        )
+    ],
+    loc="lower right"
+)
+
+plt.tight_layout()
+plt.show()
+
+
+feature_index = {
+    name: i
+    for i, name in enumerate(feature_cols)
+}
+
+TREE_I = feature_index["tree_vegetation"]
+NONTREE_I = feature_index["non_tree_vegetation"]
+WATER_I = feature_index["water_body"]
+BARE_I = feature_index["bare_land"]
+
+
+block_X = {}
+
+for block in BLOCKS:
+    block_mask = df_clean[BLOCK_COL] == block
+
+    block_X[block] = (
+        df_encoded
+        .loc[block_mask, feature_cols]
+        .to_numpy()
+        .copy()
+    )
+
+
+def predict_delta(
+    block,
+    tree=0.0,
+    non_tree=0.0,
+    water=0.0
+):
+    baseline = block_X[block]
+    scenario = baseline.copy()
+
+    scenario[:, TREE_I] += tree
+    scenario[:, NONTREE_I] += non_tree
+    scenario[:, WATER_I] += water
+
+    scenario[:, BARE_I] = np.clip(
+        scenario[:, BARE_I]
+        - (tree + non_tree + water),
+        0,
+        None
+    )
+
+    baseline_mean = (
+        best_model
+        .predict(baseline)
+        .mean()
+    )
+
+    scenario_mean = (
+        best_model
+        .predict(scenario)
+        .mean()
+    )
+
+    return float(
+        scenario_mean - baseline_mean
+    )
+
+
+def block_weights(block):
+    bare_budget = float(
+        block_X[block][:, BARE_I].mean()
+    )
+
+    effects = {
+        "tree": predict_delta(
+            block,
+            tree=bare_budget
+        ),
+        "non_tree": predict_delta(
+            block,
+            non_tree=bare_budget
+        ),
+        "water": predict_delta(
+            block,
+            water=bare_budget
+        )
+    }
+
+    cooling = {
+        name: abs(delta)
+        for name, delta in effects.items()
+        if delta < 0
+    }
+
+    if not cooling:
+        return None
+
+    total = sum(cooling.values())
+
+    return {
+        name: cooling.get(name, 0.0) / total
+        for name in [
+            "tree",
+            "non_tree",
+            "water"
+        ]
+    }
+
+
+def derive_scenario(
+    block,
+    target_delta,
+    step=0.005
+):
+    weights = block_weights(block)
+
+    bare_budget = float(
+        block_X[block][:, BARE_I].mean()
+    )
+
+    tree = 0.0
+    non_tree = 0.0
+    water = 0.0
+
+    if weights is None:
+        return {
+            "block": block,
+            "target": target_delta,
+            "achieved": 0.0,
+            "tree": 0.0,
+            "non_tree": 0.0,
+            "water": 0.0,
+            "bare": 0.0,
+            "feasible": False
+        }
+
+    while (
+        tree
+        + non_tree
+        + water
+        + step
+        <= bare_budget + 1e-9
+    ):
+        tree += (
+            step
+            * weights["tree"]
+        )
+
+        non_tree += (
+            step
+            * weights["non_tree"]
+        )
+
+        water += (
+            step
+            * weights["water"]
+        )
+
+        delta = predict_delta(
+            block,
+            tree=tree,
+            non_tree=non_tree,
+            water=water
+        )
+
+        if delta <= target_delta:
+            return {
+                "block": block,
+                "target": target_delta,
+                "achieved": round(delta, 3),
+                "tree": round(tree, 4),
+                "non_tree": round(non_tree, 4),
+                "water": round(water, 4),
+                "bare": round(
+                    -(tree + non_tree + water),
+                    4
+                ),
+                "feasible": True
+            }
+
+
+    delta = predict_delta(
+        block,
+        tree=tree,
+        non_tree=non_tree,
+        water=water
+    )
+
+    return {
+        "block": block,
+        "target": target_delta,
+        "achieved": round(delta, 3),
+        "tree": round(tree, 4),
+        "non_tree": round(non_tree, 4),
+        "water": round(water, 4),
+        "bare": round(
+            -(tree + non_tree + water),
+            4
+        ),
+        "feasible": False
+    }
+
+
+TARGETS = [
+    -0.5,
+    -1.0,
+    -2.0,
+    -3.0,
+    -4.0,
+    -5.0
+]
+
+
+scenario_rows = [
+    derive_scenario(
+        block,
+        target
+    )
+    for block in BLOCKS
+    for target in TARGETS
+]
+
+
+scenario_df = pd.DataFrame(
+    scenario_rows
+)
+
+
+for col in [
+    "tree",
+    "non_tree",
+    "water",
+    "bare"
+]:
+    scenario_df[f"{col}_pct"] = (
+        scenario_df[col] * 100
+    ).round(1)
+
+
+scenario_df[
+    [
+        "block",
+        "target",
+        "achieved",
+        "tree_pct",
+        "non_tree_pct",
+        "water_pct",
+        "bare_pct",
+        "feasible"
+    ]
+]
+
+
+def format_scenario(row):
+    return (
+        f"Tree {row['tree_pct']:+.1f}%, "
+        f"Non-tree {row['non_tree_pct']:+.1f}%, "
+        f"Water {row['water_pct']:+.1f}%, "
+        f"Bare {row['bare_pct']:+.1f}% "
+        f"[{row['achieved']:+.2f}°C]"
+    )
+
+
+scenario_df["scenario"] = (
+    scenario_df.apply(
+        format_scenario,
+        axis=1
+    )
+)
+
+
+target_labels = {
+    -0.5: "−0.5°C",
+    -1.0: "−1.0°C",
+    -2.0: "−2.0°C",
+    -3.0: "−3.0°C",
+    -4.0: "−4.0°C",
+    -5.0: "−5.0°C"
+}
+
+
+scenario_df["target_label"] = (
+    scenario_df["target"]
+    .map(target_labels)
+)
+
+
+scenario_table = scenario_df.pivot(
+    index="block",
+    columns="target_label",
+    values="scenario"
+)
+
+scenario_table = scenario_table[
+    [
+        target_labels[target]
+        for target in TARGETS
+    ]
+]
+
+scenario_table
+
+
+tree_conversion_delta = {
+    block: predict_delta(
+        block,
+        tree=float(
+            block_X[block][:, BARE_I].mean()
+        )
+    )
+    for block in BLOCKS
+}
+
+
+fig, axes = plt.subplots(
+    1,
+    2,
+    figsize=(14, 5)
+)
+
+
+block_labels = [
+    block.replace("_", " ").title()
+    for block in BLOCKS
+]
+
+
+cooling_values = [
+    abs(tree_conversion_delta[block])
+    for block in BLOCKS
+]
+
+
+axes[0].bar(
+    block_labels,
+    cooling_values,
+    color="steelblue",
+    edgecolor="white"
+)
+
+axes[0].set_ylabel(
+    "|Predicted ΔT| (°C)"
+)
+
+axes[0].set_title(
+    "All-bare-to-tree sensitivity"
+)
+
+
+for i, value in enumerate(cooling_values):
+    axes[0].text(
+        i,
+        value,
+        f"{value:.2f}",
+        ha="center",
+        va="bottom",
+        fontsize=9
+    )
+
+
+feasibility = (
+    scenario_df
+    .groupby("block")["feasible"]
+    .sum()
+)
+
+
+feasibility.index = [
+    block.replace("_", " ").title()
+    for block in feasibility.index
+]
+
+
+feasibility.plot(
+    kind="bar",
+    ax=axes[1],
+    color="mediumseagreen",
+    edgecolor="white"
+)
+
+
+axes[1].set_ylabel(
+    f"Targets reached (out of {len(TARGETS)})"
+)
+
+axes[1].set_title(
+    "Scenario feasibility"
+)
+
+axes[1].tick_params(
+    axis="x",
+    rotation=30
+)
+
+axes[1].set_ylim(
+    0,
+    len(TARGETS) + 1
+)
+
+plt.tight_layout()
+plt.show()
+
+
+feasible_df = (
+    scenario_df[
+        scenario_df["feasible"]
+    ]
+    .copy()
+)
+
+
+if not feasible_df.empty:
+    fig, axes = plt.subplots(
+        1,
+        len(BLOCKS),
+        figsize=(18, 5)
+    )
+
+    components = [
+        (
+            "tree_pct",
+            "darkgreen",
+            "Tree"
+        ),
+        (
+            "non_tree_pct",
+            "lightgreen",
+            "Non-tree"
+        ),
+        (
+            "water_pct",
+            "steelblue",
+            "Water"
+        )
+    ]
+
+    for ax, block in zip(
+        axes,
+        BLOCKS
+    ):
+        block_df = feasible_df[
+            feasible_df["block"] == block
+        ]
+
+        if block_df.empty:
+            ax.text(
+                0.5,
+                0.5,
+                "No target reached",
+                ha="center",
+                va="center",
+                transform=ax.transAxes
+            )
+
+            ax.set_title(
+                block
+                .replace("_", " ")
+                .title()
+            )
+
+            continue
+
+        labels = (
+            block_df["target_label"]
+            .tolist()
+        )
+
+        bottom = np.zeros(
+            len(block_df)
+        )
+
+        for col, color, label in components:
+            values = (
+                block_df[col]
+                .to_numpy()
+            )
+
+            ax.bar(
+                labels,
+                values,
+                bottom=bottom,
+                color=color,
+                label=label,
+                edgecolor="white",
+                linewidth=0.3
+            )
+
+            bottom += values
+
+        ax.set_title(
+            block
+            .replace("_", " ")
+            .title()
+        )
+
+        ax.set_xlabel("Target")
+
+        ax.tick_params(
+            axis="x",
+            rotation=45
+        )
+
+    axes[0].set_ylabel(
+        "Area converted (%)"
+    )
+
+    axes[0].legend(
+        fontsize=8
+    )
+
+    plt.suptitle(
+        "Composition of feasible scenarios",
+        y=1.02
+    )
+
+    plt.tight_layout()
+    plt.show()
+
+else:
+    print(
+        "No target was reached within "
+        "the available bare-land budget."
+    )
+
+
+output_columns = [
+    "block",
+    "target",
+    "achieved",
+    "tree_pct",
+    "non_tree_pct",
+    "water_pct",
+    "bare_pct",
+    "feasible"
+]
+
+
+scenario_df[
+    output_columns
+].to_csv(
+    RESULTS_DIR
+    / "intervention_scenarios.csv",
+    index=False
+)
+
+
+scenario_table.to_csv(
+    RESULTS_DIR
+    / "intervention_scenario_table.csv"
+)
+
+
+print(f"Best model: {best_name}")
+print(f"Test R²: {test_r2:.4f}")
+print(f"Test RMSE: {test_rmse:.4f} °C")
+print(f"Test MAE: {test_mae:.4f} °C")
